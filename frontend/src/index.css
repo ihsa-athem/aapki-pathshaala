@@ -1,0 +1,22 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Smooth scrollbar for transcript and chat panels */
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: #c7d2fe #f8fafc;
+}
+.scrollbar-thin::-webkit-scrollbar { width: 6px; }
+.scrollbar-thin::-webkit-scrollbar-track { background: #f8fafc; }
+.scrollbar-thin::-webkit-scrollbar-thumb { background-color: #c7d2fe; border-radius: 3px; }
