@@ -13,6 +13,7 @@ COPY . .
 
 EXPOSE 8000
 
-# Shell form (not exec/array form) so $PORT is expanded by sh at runtime.
-# Falls back to 8000 if PORT is not set (local dev).
+# Shell form so ${PORT} is expanded at runtime.
+# railway.json startCommand overrides this, but this is the fallback for
+# docker-compose / local docker run.
 CMD sh -c "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
