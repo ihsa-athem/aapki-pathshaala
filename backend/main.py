@@ -125,13 +125,10 @@ def _wav_duration(path: str) -> float:
         return 300.0
 
 
-async def _download_yt_audio(url: str, out_path: str) -> float:
-    # yt-dlp 2026.x only looks for *deno* by default — even if nodejs is installed
-    # it won't be used unless we pass --js-runtimes node explicitly.
-    # web + mweb clients need the JS n-challenge solver; android_vr does not but
-    # may return fewer formats. We specify node first, deno as fallback.
-    cmd = [
+def _build_ytdlp_cmd(url: str, out_path: str) -> list:
+    return [
         "yt-dlp",
+        # Audio-only format — avoids downloading video data
         "--format", "bestaudio[ext=m4a]/bestaudio/best",
         "-x",
         "--audio-format", "wav",
@@ -139,13 +136,39 @@ async def _download_yt_audio(url: str, out_path: str) -> float:
         "--ffmpeg-location", FFMPEG_BIN,
         "--no-check-formats",
         "--no-check-certificates",
+        # Client order: web → mweb (both need JS n-challenge solver)
         "--extractor-args", "youtube:player_client=web,mweb",
-        "--js-runtimes", "node,deno",   # tell yt-dlp where to find JS runtimes
+        # yt-dlp 2026.x only detects deno by default; be explicit
+        "--js-runtimes", "deno",
+        # Rate-limiting: look like a real browser and pace requests
+        "--user-agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "--add-header", "Accept-Language: en-US,en;q=0.9",
+        "--sleep-interval", "3",
+        "--max-sleep-interval", "6",
+        "--retries", "3",          # yt-dlp internal retries for transient errors
         "-o", out_path,
         "--no-playlist", "--no-progress",
         url,
     ]
+
+
+async def _download_yt_audio(url: str, out_path: str) -> float:
+    cmd = _build_ytdlp_cmd(url, out_path)
     result = await _exec(cmd)
+
+    # 429 Too Many Requests — Railway's IP got rate-limited by YouTube.
+    # Wait 10 s and retry once before giving up.
+    if result.returncode != 0:
+        stderr = result.stderr.decode()
+        is_429 = "429" in stderr or "too many requests" in stderr.lower()
+        if is_429:
+            print(f"[yt-dlp] 429 rate-limit hit — waiting 10 s then retrying once")
+            await asyncio.sleep(10)
+            Path(out_path).unlink(missing_ok=True)
+            result = await _exec(cmd)
+
     if result.returncode != 0 or not Path(out_path).exists():
         raise HTTPException(400, f"yt-dlp error:\n{result.stderr.decode()[:500]}")
     return _wav_duration(out_path)
