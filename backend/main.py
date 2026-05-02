@@ -126,9 +126,10 @@ def _wav_duration(path: str) -> float:
 
 
 async def _download_yt_audio(url: str, out_path: str) -> float:
-    # No --extractor-args: yt-dlp's default android_vr client works without
-    # a JS runtime or PO tokens. The "JS runtime" warning is non-fatal —
-    # audio formats still extract.
+    # yt-dlp 2026.x only looks for *deno* by default — even if nodejs is installed
+    # it won't be used unless we pass --js-runtimes node explicitly.
+    # web + mweb clients need the JS n-challenge solver; android_vr does not but
+    # may return fewer formats. We specify node first, deno as fallback.
     cmd = [
         "yt-dlp",
         "--format", "bestaudio[ext=m4a]/bestaudio/best",
@@ -137,6 +138,9 @@ async def _download_yt_audio(url: str, out_path: str) -> float:
         "--postprocessor-args", "ffmpeg:-ar 16000 -ac 1",
         "--ffmpeg-location", FFMPEG_BIN,
         "--no-check-formats",
+        "--no-check-certificates",
+        "--extractor-args", "youtube:player_client=web,mweb",
+        "--js-runtimes", "node,deno",   # tell yt-dlp where to find JS runtimes
         "-o", out_path,
         "--no-playlist", "--no-progress",
         url,
