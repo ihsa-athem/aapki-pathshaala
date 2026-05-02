@@ -28,14 +28,24 @@ from sarvam import transcribe_audio as sarvam_transcribe
 from sarvam import transcribe_question as sarvam_transcribe_question
 from transcript_store import TranscriptStore, make_video_id
 
-app = FastAPI(title="AI Office Hours API", version="1.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+app = FastAPI(title="Aapki Pathshaala API", version="1.0.0")
+
+# CORS: read allowed origins from env var so production frontend domains work.
+# Set ALLOWED_ORIGINS="https://your-app.vercel.app" in Railway env vars.
+# Falls back to localhost for local dev.
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "")
+_origins: list = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+if not _origins:
+    _origins = [
         "http://localhost:5173",
         "http://localhost:3000",
         "http://127.0.0.1:5173",
-    ],
+    ]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",  # allow any Vercel preview URL
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
