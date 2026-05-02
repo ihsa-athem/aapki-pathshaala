@@ -407,6 +407,89 @@ async def _fetch_youtube_transcript(url: str, cookies_path: Optional[str] = None
     return await loop.run_in_executor(None, _sync_fetch)
 
 
+def _parse_json3_subtitles(path: Path) -> List[dict]:
+    """Parse YouTube json3 subtitle file into transcript chunks."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        buf_words: List[str] = []
+        buf_start: Optional[float] = None
+        buf_end: float = 0.0
+        chunks: List[dict] = []
+        for event in data.get("events", []):
+            segs = event.get("segs")
+            if not segs:
+                continue
+            start = event.get("tStartMs", 0) / 1000.0
+            end   = (event.get("tStartMs", 0) + event.get("dDurationMs", 2000)) / 1000.0
+            text  = "".join(s.get("utf8", "") for s in segs).strip()
+            if not text or text == "\n":
+                continue
+            if buf_start is None:
+                buf_start = start
+            buf_end = end
+            buf_words.append(text)
+            if sum(len(w.split()) for w in buf_words) >= WORDS_PER_CHUNK:
+                chunks.append({"text": " ".join(buf_words), "start_time": buf_start, "end_time": buf_end})
+                buf_words, buf_start = [], None
+        if buf_words:
+            chunks.append({"text": " ".join(buf_words), "start_time": buf_start or 0.0, "end_time": buf_end})
+        return chunks
+    except Exception as e:
+        print(f"[parse-json3] error: {e}")
+        return []
+
+
+async def _fetch_yt_subtitles(url: str, cookies_path: Optional[str] = None) -> Optional[List[dict]]:
+    """Download subtitle file via yt-dlp --skip-download (android_vr API, no video download).
+
+    Returns:
+        List[dict]  — subtitle chunks
+        []          — yt-dlp succeeded but no subtitles available for this video
+        None        — yt-dlp was blocked (429)
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        cmd = [
+            "yt-dlp",
+            "--write-auto-subs", "--write-subs",
+            "--sub-langs", "en,en-IN,hi,hi-IN",
+            "--sub-format", "json3",
+            "--skip-download",
+            "--no-check-certificates",
+            "--no-check-formats",
+            "--extractor-args", "youtube:player_client=android_vr,mweb,web",
+            "--js-runtimes", "node,deno",
+            "--user-agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "--add-header", "Accept-Language: en-US,en;q=0.9",
+            "--retries", "2",
+            "-o", os.path.join(tmp, "%(id)s.%(ext)s"),
+            "--no-playlist", "--no-progress",
+        ]
+        if cookies_path:
+            cmd += ["--cookies", cookies_path]
+        cmd.append(url)
+
+        result = await _exec(cmd)
+
+        if result.returncode != 0:
+            stderr = result.stderr.decode()
+            if "429" in stderr or "too many requests" in stderr.lower():
+                print("[yt-dlp-subs] 429 — blocked")
+                return None
+            print(f"[yt-dlp-subs] failed: {stderr[:200]}")
+            return []
+
+        for f in sorted(Path(tmp).glob("*.json3")):
+            chunks = _parse_json3_subtitles(f)
+            if chunks:
+                print(f"[yt-dlp-subs] {len(chunks)} chunks from {f.name}")
+                return chunks
+
+        print("[yt-dlp-subs] ran OK but no json3 subtitle files found")
+        return []
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.post("/api/load-video")
@@ -427,17 +510,9 @@ async def load_video(req: LoadVideoRequest):
             # ── Get cookies once — passed to both transcript API and yt-dlp
             cookies_path = _get_cookies_path()
             try:
-                # ── 1. YouTube Transcript API (fast, uses existing captions) ──
+                # ── 1. YouTube Transcript API (fast, no subprocess overhead) ──
                 yield _sse({"type": "status", "message": "📄 Fetching transcript..."})
                 t_result = await _fetch_youtube_transcript(url, cookies_path)
-
-                if t_result is None:
-                    # YouTube is actively blocking this server's IP (429).
-                    # yt-dlp would hit the same block — stop now.
-                    hint = "" if cookies_path else " Set YOUTUBE_COOKIES in Railway env vars to fix this."
-                    yield _sse({"type": "error", "message": f"429: YouTube is rate-limiting this server.{hint}"})
-                    yield "data: [DONE]\n\n"
-                    return
 
                 if t_result:
                     for chunk in t_result:
@@ -451,8 +526,33 @@ async def load_video(req: LoadVideoRequest):
                     yield "data: [DONE]\n\n"
                     return
 
-                # ── 2. Fallback: yt-dlp audio download + Sarvam STT ──────────
-                # Only reached for videos that have no YouTube captions at all.
+                # ── 2. yt-dlp subtitle download (android_vr API — different path ──
+                # transcript-api uses the YouTube web page (gets 429 from datacenter IPs);
+                # yt-dlp uses the Android mobile API which bypasses that block.
+                yield _sse({"type": "status", "message": "📥 Fetching subtitles..."})
+                sub_result = await _fetch_yt_subtitles(url, cookies_path)
+
+                if sub_result is None:
+                    # Both methods got blocked — nothing left to try
+                    hint = "" if cookies_path else " Set YOUTUBE_COOKIES in Railway env vars to fix this."
+                    yield _sse({"type": "error", "message": f"429: YouTube is blocking this server.{hint}"})
+                    yield "data: [DONE]\n\n"
+                    return
+
+                if sub_result:
+                    for chunk in sub_result:
+                        yield _sse({"type": "chunk", "chunk": chunk})
+                    try:
+                        store.save_video(vid_id, url)
+                        store.save_chunks(vid_id, sub_result)
+                    except Exception as e:
+                        print(f"[save] error: {e}")
+                    yield _sse({"type": "done", "video_id": vid_id})
+                    yield "data: [DONE]\n\n"
+                    return
+
+                # ── 3. yt-dlp full audio download + Sarvam STT ───────────────
+                # Reached only for videos that have absolutely no captions/subtitles.
                 yield _sse({"type": "status", "message": "⬇️ No captions — downloading audio..."})
 
                 all_chunks: List[dict] = []
