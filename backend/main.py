@@ -167,7 +167,7 @@ def _build_ytdlp_cmd(url: str, out_path: str, cookies_path: Optional[str] = None
         # android_vr first: uses Android API endpoints, far less rate-limited than web.
         # Falls back to mweb → web if android_vr formats are unavailable.
         "--extractor-args", "youtube:player_client=android_vr,mweb,web",
-        "--js-runtimes", "node,deno",
+        "--js-runtimes", "node",
         "--user-agent",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -452,9 +452,11 @@ async def _fetch_supadata_transcript(url: str) -> Optional[List[dict]]:
     """
     api_key = os.getenv("SUPADATA_API_KEY", "").strip()
     if not api_key:
+        print("[supadata] SUPADATA_API_KEY not set — skipping")
         return []  # not configured — skip silently
 
     try:
+        print(f"[supadata] fetching transcript for {url[:80]}")
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(
                 "https://api.supadata.ai/v1/youtube/transcript",
@@ -462,6 +464,7 @@ async def _fetch_supadata_transcript(url: str) -> Optional[List[dict]]:
                 params={"url": url},
             )
 
+        print(f"[supadata] HTTP {resp.status_code} — body: {resp.text[:200]}")
         if resp.status_code == 404:
             print("[supadata] no transcript available for this video")
             return []
@@ -469,7 +472,7 @@ async def _fetch_supadata_transcript(url: str) -> Optional[List[dict]]:
             print("[supadata] rate limited")
             return None
         if resp.status_code != 200:
-            print(f"[supadata] error {resp.status_code}: {resp.text[:200]}")
+            print(f"[supadata] error {resp.status_code}: {resp.text[:300]}")
             return []
 
         data = resp.json()
@@ -526,7 +529,7 @@ async def _fetch_yt_subtitles(url: str, cookies_path: Optional[str] = None) -> O
             "--no-check-certificates",
             "--no-check-formats",
             "--extractor-args", "youtube:player_client=android_vr,mweb,web",
-            "--js-runtimes", "node,deno",
+            "--js-runtimes", "node",
             "--user-agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -543,10 +546,13 @@ async def _fetch_yt_subtitles(url: str, cookies_path: Optional[str] = None) -> O
 
         if result.returncode != 0:
             stderr = result.stderr.decode()
-            if "429" in stderr or "too many requests" in stderr.lower():
-                print("[yt-dlp-subs] 429 — blocked")
-                return None
-            print(f"[yt-dlp-subs] failed: {stderr[:200]}")
+            stderr_l = stderr.lower()
+            if ("429" in stderr or "too many requests" in stderr_l
+                    or "no title found" in stderr_l or "player response" in stderr_l
+                    or "sign in" in stderr_l or "confirm your age" in stderr_l):
+                print(f"[yt-dlp-subs] blocked/error — treating as 429: {stderr[:150]}")
+                return None  # YouTube is blocking — don't fall through to full download
+            print(f"[yt-dlp-subs] non-blocking failure (no subs?): {stderr[:150]}")
             return []
 
         for f in sorted(Path(tmp).glob("*.json3")):
