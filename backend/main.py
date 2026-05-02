@@ -125,10 +125,37 @@ def _wav_duration(path: str) -> float:
         return 300.0
 
 
-def _build_ytdlp_cmd(url: str, out_path: str) -> list:
-    return [
+def _get_cookies_path() -> Optional[str]:
+    """
+    Write the YOUTUBE_COOKIES env var to a temp file and return its path.
+
+    In Railway dashboard: Settings → Variables → Add
+      Name:  YOUTUBE_COOKIES
+      Value: (paste full contents of cookies.txt in Netscape format)
+
+    How to get cookies.txt:
+      1. Install "Get cookies.txt LOCALLY" Chrome/Firefox extension
+      2. Go to https://www.youtube.com while logged in to a Google account
+      3. Click the extension → "Export" → save as cookies.txt
+      4. Copy the entire file contents into the Railway YOUTUBE_COOKIES variable
+    """
+    raw = os.getenv("YOUTUBE_COOKIES", "").strip()
+    if not raw:
+        return None
+    try:
+        f = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+        f.write(raw)
+        f.close()
+        print(f"[yt-dlp] using YOUTUBE_COOKIES from env ({len(raw)} chars)")
+        return f.name
+    except Exception as e:
+        print(f"[yt-dlp] failed to write cookies file: {e}")
+        return None
+
+
+def _build_ytdlp_cmd(url: str, out_path: str, cookies_path: Optional[str] = None) -> list:
+    cmd = [
         "yt-dlp",
-        # Audio-only format — avoids downloading video data
         "--format", "bestaudio[ext=m4a]/bestaudio/best",
         "-x",
         "--audio-format", "wav",
@@ -136,42 +163,52 @@ def _build_ytdlp_cmd(url: str, out_path: str) -> list:
         "--ffmpeg-location", FFMPEG_BIN,
         "--no-check-formats",
         "--no-check-certificates",
-        # Client order: web → mweb (both need JS n-challenge solver)
-        "--extractor-args", "youtube:player_client=web,mweb",
-        # yt-dlp 2026.x only detects deno by default; be explicit
+        # android_vr first: uses Android API endpoints, far less rate-limited than web.
+        # Falls back to mweb → web if android_vr formats are unavailable.
+        "--extractor-args", "youtube:player_client=android_vr,mweb,web",
         "--js-runtimes", "deno",
-        # Rate-limiting: look like a real browser and pace requests
         "--user-agent",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "--add-header", "Accept-Language: en-US,en;q=0.9",
-        "--sleep-interval", "3",
-        "--max-sleep-interval", "6",
-        "--retries", "3",          # yt-dlp internal retries for transient errors
+        "--sleep-interval", "2",
+        "--max-sleep-interval", "5",
+        "--retries", "5",
+        "--fragment-retries", "5",
         "-o", out_path,
         "--no-playlist", "--no-progress",
-        url,
     ]
+    if cookies_path:
+        cmd += ["--cookies", cookies_path]
+    cmd.append(url)
+    return cmd
 
 
 async def _download_yt_audio(url: str, out_path: str) -> float:
-    cmd = _build_ytdlp_cmd(url, out_path)
-    result = await _exec(cmd)
+    cookies_path = _get_cookies_path()
+    cmd = _build_ytdlp_cmd(url, out_path, cookies_path)
 
-    # 429 Too Many Requests — Railway's IP got rate-limited by YouTube.
-    # Wait 10 s and retry once before giving up.
-    if result.returncode != 0:
-        stderr = result.stderr.decode()
-        is_429 = "429" in stderr or "too many requests" in stderr.lower()
-        if is_429:
-            print(f"[yt-dlp] 429 rate-limit hit — waiting 10 s then retrying once")
-            await asyncio.sleep(10)
-            Path(out_path).unlink(missing_ok=True)
-            result = await _exec(cmd)
+    try:
+        result = await _exec(cmd)
 
-    if result.returncode != 0 or not Path(out_path).exists():
-        raise HTTPException(400, f"yt-dlp error:\n{result.stderr.decode()[:500]}")
-    return _wav_duration(out_path)
+        # 429: Railway's datacenter IP is blocked by YouTube.
+        # Cookies (YOUTUBE_COOKIES env var) are the real fix; this retry
+        # just gives yt-dlp's own back-off a chance to clear the block.
+        if result.returncode != 0:
+            stderr = result.stderr.decode()
+            if "429" in stderr or "too many requests" in stderr.lower():
+                print("[yt-dlp] 429 hit — waiting 15 s and retrying once")
+                await asyncio.sleep(15)
+                Path(out_path).unlink(missing_ok=True)
+                result = await _exec(cmd)
+
+        if result.returncode != 0 or not Path(out_path).exists():
+            raise HTTPException(400, f"yt-dlp error:\n{result.stderr.decode()[:500]}")
+        return _wav_duration(out_path)
+    finally:
+        # Always clean up temp cookies file
+        if cookies_path:
+            Path(cookies_path).unlink(missing_ok=True)
 
 
 async def _convert_to_wav(audio_bytes: bytes, suffix: str = ".webm") -> bytes:
