@@ -559,13 +559,21 @@ export default function App() {
 
 function friendlyError(msg = '') {
   const m = msg.toLowerCase()
+  if (m.includes('vite_api_url') || m.includes('wrong response type') || m.includes('event-stream'))
+    return '⚙️ API URL not configured — Set VITE_API_URL in your Vercel environment variables'
   if (m.includes('internal server') || m.includes('500') || m.includes('server error'))
     return 'कुछ गड़बड़ हो गई 😅 — Please try again!'
   if (m.includes('failed to fetch') || m.includes('networkerror') || m.includes('load failed'))
     return '🌐 Connection issue — कृपया internet check करें और retry करें'
+  if (m.includes('cors') || m.includes('cross-origin'))
+    return '🔒 CORS error — The backend needs to allow your frontend domain (check ALLOWED_ORIGINS in Railway)'
   if (m.includes('404') || m.includes('not found'))
     return '🔍 Video not found — कृपया YouTube URL check करें'
-  if (m.includes('400') || m.includes('invalid') || m.includes('yt-dlp error'))
+  // yt-dlp errors are backend download failures, NOT invalid URLs —
+  // show the actual error so it can be debugged, rather than blaming the URL
+  if (m.includes('yt-dlp error'))
+    return `⬇️ Video download failed on server — ${msg.replace(/^yt-dlp error[:\s]*/i, '').slice(0, 120)}`
+  if (m.includes('400') || m.includes('invalid'))
     return '🔗 Could not load this video — कृपया एक valid YouTube link paste करें'
   if (m.includes('timeout') || m.includes('timed out'))
     return '⏱️ Request timed out — Please try again!'

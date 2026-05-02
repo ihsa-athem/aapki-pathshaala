@@ -3,44 +3,94 @@
 // In production, set VITE_API_URL to the deployed backend URL.
 const API = import.meta.env.VITE_API_URL || ''
 
+// Log the API base URL once at startup so it's visible in browser console
+console.log('[api] VITE_API_URL =', import.meta.env.VITE_API_URL || '(not set — using Vite proxy)')
+console.log('[api] API base =', API || '(relative URL — Vite proxy in dev, Vercel rewrite in prod)')
+
 export async function loadVideo(videoUrl, { onStatus, onChunk, onCached, onDone, onError } = {}) {
+  const endpoint = `${API}/api/load-video`
+  console.log('[loadVideo] starting — endpoint:', endpoint, '| url:', videoUrl)
+
   let res
   try {
-    res = await fetch(`${API}/api/load-video`, {
+    res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ video_url: videoUrl }),
     })
   } catch (err) {
-    onError?.(err); return
+    console.error('[loadVideo] fetch threw (network/CORS?):', err)
+    onError?.(err)
+    return
   }
+
+  console.log('[loadVideo] HTTP response:', res.status, res.statusText,
+    '| content-type:', res.headers.get('content-type'))
+
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }))
-    onError?.(new Error(err.detail || 'Failed to load video')); return
+    let detail = res.statusText
+    try { detail = (await res.json()).detail || detail } catch {}
+    console.error('[loadVideo] non-200 response:', res.status, detail)
+    onError?.(new Error(detail || 'Failed to load video'))
+    return
+  }
+
+  // Confirm we're getting SSE — if we get HTML back VITE_API_URL is probably missing
+  const ct = res.headers.get('content-type') || ''
+  if (!ct.includes('text/event-stream')) {
+    console.error('[loadVideo] Expected SSE but got:', ct,
+      '— Is VITE_API_URL set correctly in Vercel env vars?')
+    onError?.(new Error(
+      `Wrong response type (got "${ct}"). ` +
+      'Check that VITE_API_URL is set in your Vercel environment variables.'
+    ))
+    return
   }
 
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
+  let eventCount = 0
 
   while (true) {
     const { done, value } = await reader.read()
-    if (done) break
+    if (done) {
+      console.log('[loadVideo] stream ended — total events received:', eventCount)
+      break
+    }
     buffer += decoder.decode(value, { stream: true })
     const lines = buffer.split('\n')
     buffer = lines.pop() ?? ''
     for (const line of lines) {
       if (!line.startsWith('data: ')) continue
       const data = line.slice(6).trim()
-      if (data === '[DONE]') return
+      if (data === '[DONE]') {
+        console.log('[loadVideo] [DONE] received after', eventCount, 'events')
+        return
+      }
       try {
         const ev = JSON.parse(data)
-        if (ev.type === 'status') onStatus?.(ev.message)
-        else if (ev.type === 'chunk')  onChunk?.(ev.chunk)
-        else if (ev.type === 'cached') onCached?.(ev.video_id, ev.chunks)
-        else if (ev.type === 'done')   onDone?.(ev.video_id)
-        else if (ev.type === 'error')  onError?.(new Error(ev.message))
-      } catch {}
+        eventCount++
+        if (ev.type === 'status') {
+          console.log('[loadVideo] status:', ev.message)
+          onStatus?.(ev.message)
+        } else if (ev.type === 'chunk') {
+          onChunk?.(ev.chunk)
+        } else if (ev.type === 'cached') {
+          console.log('[loadVideo] cached — video_id:', ev.video_id, '| chunks:', ev.chunks?.length)
+          onCached?.(ev.video_id, ev.chunks)
+        } else if (ev.type === 'done') {
+          console.log('[loadVideo] done — video_id:', ev.video_id)
+          onDone?.(ev.video_id)
+        } else if (ev.type === 'error') {
+          console.error('[loadVideo] backend error event:', ev.message)
+          onError?.(new Error(ev.message))
+        } else {
+          console.warn('[loadVideo] unknown event type:', ev)
+        }
+      } catch (parseErr) {
+        console.error('[loadVideo] failed to parse SSE line:', JSON.stringify(line), parseErr)
+      }
     }
   }
 }
