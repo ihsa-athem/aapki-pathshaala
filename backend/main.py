@@ -166,7 +166,7 @@ def _build_ytdlp_cmd(url: str, out_path: str, cookies_path: Optional[str] = None
         # android_vr first: uses Android API endpoints, far less rate-limited than web.
         # Falls back to mweb → web if android_vr formats are unavailable.
         "--extractor-args", "youtube:player_client=android_vr,mweb,web",
-        "--js-runtimes", "deno",
+        "--js-runtimes", "node,deno",
         "--user-agent",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -184,31 +184,22 @@ def _build_ytdlp_cmd(url: str, out_path: str, cookies_path: Optional[str] = None
     return cmd
 
 
-async def _download_yt_audio(url: str, out_path: str) -> float:
-    cookies_path = _get_cookies_path()
+async def _download_yt_audio(url: str, out_path: str, cookies_path: Optional[str] = None) -> float:
+    """Download YouTube audio. Caller owns the cookies_path lifecycle."""
     cmd = _build_ytdlp_cmd(url, out_path, cookies_path)
+    result = await _exec(cmd)
 
-    try:
-        result = await _exec(cmd)
+    if result.returncode != 0:
+        stderr = result.stderr.decode()
+        if "429" in stderr or "too many requests" in stderr.lower():
+            print("[yt-dlp] 429 hit — waiting 15 s and retrying once")
+            await asyncio.sleep(15)
+            Path(out_path).unlink(missing_ok=True)
+            result = await _exec(cmd)
 
-        # 429: Railway's datacenter IP is blocked by YouTube.
-        # Cookies (YOUTUBE_COOKIES env var) are the real fix; this retry
-        # just gives yt-dlp's own back-off a chance to clear the block.
-        if result.returncode != 0:
-            stderr = result.stderr.decode()
-            if "429" in stderr or "too many requests" in stderr.lower():
-                print("[yt-dlp] 429 hit — waiting 15 s and retrying once")
-                await asyncio.sleep(15)
-                Path(out_path).unlink(missing_ok=True)
-                result = await _exec(cmd)
-
-        if result.returncode != 0 or not Path(out_path).exists():
-            raise HTTPException(400, f"yt-dlp error:\n{result.stderr.decode()[:500]}")
-        return _wav_duration(out_path)
-    finally:
-        # Always clean up temp cookies file
-        if cookies_path:
-            Path(cookies_path).unlink(missing_ok=True)
+    if result.returncode != 0 or not Path(out_path).exists():
+        raise HTTPException(400, f"yt-dlp error:\n{result.stderr.decode()[:500]}")
+    return _wav_duration(out_path)
 
 
 async def _convert_to_wav(audio_bytes: bytes, suffix: str = ".webm") -> bytes:
@@ -337,34 +328,58 @@ def _extract_video_id(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-async def _fetch_youtube_transcript(url: str) -> List[dict]:
+async def _fetch_youtube_transcript(url: str, cookies_path: Optional[str] = None) -> Optional[List[dict]]:
     """Fetch YouTube captions via transcript API without downloading video.
-    Returns [] if the video has no captions or the API call fails."""
+
+    Returns:
+        List[dict]  — transcript chunks (may be empty if no captions exist)
+        None        — YouTube is blocking this server's IP (HTTP 429 / rate limited)
+    """
     video_id = _extract_video_id(url)
     if not video_id:
         return []
 
     loop = asyncio.get_event_loop()
 
-    def _sync_fetch() -> List[dict]:
+    def _sync_fetch() -> Optional[List[dict]]:
         try:
             from youtube_transcript_api import YouTubeTranscriptApi
-            # Prefer English; accept Hindi and Indian variants too
-            entries = YouTubeTranscriptApi.get_transcript(
-                video_id,
-                languages=["en", "en-IN", "hi", "hi-IN"],
-            )
+            try:
+                from youtube_transcript_api._errors import (
+                    TranscriptsDisabled, NoTranscriptFound, VideoUnavailable,
+                )
+                _no_captions_types: tuple = (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable)
+            except ImportError:
+                _no_captions_types = ()
+
+            kwargs: dict = {"languages": ["en", "en-IN", "hi", "hi-IN"]}
+            if cookies_path:
+                kwargs["cookies"] = cookies_path
+
+            try:
+                entries = YouTubeTranscriptApi.get_transcript(video_id, **kwargs)
+            except _no_captions_types as e:
+                print(f"[transcript-api] no captions for {video_id}: {type(e).__name__}")
+                return []  # No captions — caller may try yt-dlp audio
+            except Exception as e:
+                err_str = str(e).lower()
+                if "429" in err_str or "too many" in err_str or "blocked" in err_str:
+                    print(f"[transcript-api] rate-limited for {video_id}: {e}")
+                    return None  # IP blocked — yt-dlp will fail too, stop now
+                print(f"[transcript-api] error for {video_id}: {e}")
+                return None  # Unknown failure — don't waste time on yt-dlp
+
             chunks: List[dict] = []
             buf_words: List[str] = []
             buf_start: Optional[float] = None
             buf_end: float = 0.0
             for entry in entries:
                 text = entry.get("text", "").strip()
-                if not text:
+                # Skip music/sound effect markers
+                if not text or text.startswith("[") and text.endswith("]"):
                     continue
                 start = float(entry.get("start", 0))
-                dur   = float(entry.get("duration", 2))
-                end   = start + dur
+                end = start + float(entry.get("duration", 2))
                 if buf_start is None:
                     buf_start = start
                 buf_end = end
@@ -384,9 +399,10 @@ async def _fetch_youtube_transcript(url: str) -> List[dict]:
                 })
             print(f"[transcript-api] {len(chunks)} chunks for {video_id}")
             return chunks
+
         except Exception as e:
-            print(f"[transcript-api] failed for {video_id}: {e}")
-            return []
+            print(f"[transcript-api] unexpected error for {video_id}: {e}")
+            return None
 
     return await loop.run_in_executor(None, _sync_fetch)
 
@@ -408,130 +424,140 @@ async def load_video(req: LoadVideoRequest):
                 yield "data: [DONE]\n\n"
                 return
 
-            # ── Try YouTube Transcript API first (fast, no 429 risk) ──────
-            yield _sse({"type": "status", "message": "📄 Fetching transcript..."})
-            transcript_chunks = await _fetch_youtube_transcript(url)
-            if transcript_chunks:
-                for chunk in transcript_chunks:
-                    yield _sse({"type": "chunk", "chunk": chunk})
+            # ── Get cookies once — passed to both transcript API and yt-dlp
+            cookies_path = _get_cookies_path()
+            try:
+                # ── 1. YouTube Transcript API (fast, uses existing captions) ──
+                yield _sse({"type": "status", "message": "📄 Fetching transcript..."})
+                t_result = await _fetch_youtube_transcript(url, cookies_path)
+
+                if t_result is None:
+                    # YouTube is actively blocking this server's IP (429).
+                    # yt-dlp would hit the same block — stop now.
+                    hint = "" if cookies_path else " Set YOUTUBE_COOKIES in Railway env vars to fix this."
+                    yield _sse({"type": "error", "message": f"429: YouTube is rate-limiting this server.{hint}"})
+                    yield "data: [DONE]\n\n"
+                    return
+
+                if t_result:
+                    for chunk in t_result:
+                        yield _sse({"type": "chunk", "chunk": chunk})
+                    try:
+                        store.save_video(vid_id, url)
+                        store.save_chunks(vid_id, t_result)
+                    except Exception as e:
+                        print(f"[save] error: {e}")
+                    yield _sse({"type": "done", "video_id": vid_id})
+                    yield "data: [DONE]\n\n"
+                    return
+
+                # ── 2. Fallback: yt-dlp audio download + Sarvam STT ──────────
+                # Only reached for videos that have no YouTube captions at all.
+                yield _sse({"type": "status", "message": "⬇️ No captions — downloading audio..."})
+
+                all_chunks: List[dict] = []
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    audio_path = os.path.join(tmp, "audio.wav")
+                    try:
+                        duration = await _download_yt_audio(url, audio_path, cookies_path)
+                    except Exception as e:
+                        msg = e.detail if isinstance(e, HTTPException) else str(e)
+                        yield _sse({"type": "error", "message": msg[:400]})
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    if not Path(audio_path).exists():
+                        yield _sse({"type": "error", "message": "Audio extraction produced no file"})
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    # Split ALL segments in one ffmpeg call (faster than N separate calls)
+                    yield _sse({"type": "status", "message": "✂️ Splitting audio..."})
+                    seg_pattern = os.path.join(tmp, "seg%03d.wav")
+                    await _exec([
+                        FFMPEG_BIN, "-y", "-i", audio_path,
+                        "-f", "segment", "-segment_time", str(SEG_DURATION),
+                        "-reset_timestamps", "1", "-ar", "16000", "-ac", "1",
+                        seg_pattern, "-loglevel", "quiet",
+                    ])
+
+                    segs: List[tuple] = []
+                    idx = 0
+                    while True:
+                        sp = os.path.join(tmp, f"seg{idx:03d}.wav")
+                        if not Path(sp).exists():
+                            break
+                        t_start = idx * SEG_DURATION
+                        t_end   = min(t_start + SEG_DURATION, duration)
+                        if Path(sp).stat().st_size > 500:
+                            segs.append((idx, t_start, t_end, sp))
+                        idx += 1
+
+                    if not segs:
+                        yield _sse({"type": "error", "message": "Audio splitting produced no segments."})
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    num_segs = len(segs)
+                    sarvam_sem = asyncio.Semaphore(2)
+
+                    async def transcribe_seg(i, t_start, t_end, seg_path):
+                        async with sarvam_sem:
+                            try:
+                                with open(seg_path, "rb") as f:
+                                    audio_bytes = f.read()
+                                result = await sarvam_transcribe(audio_bytes, language_code="unknown")
+                                t_text = result.get("transcript", "")
+                                if t_text.strip():
+                                    timestamps = result.get("timestamps", [])
+                                    if timestamps:
+                                        normalized = [
+                                            {
+                                                "text": ts.get("text", ts.get("word", "")),
+                                                "start": float(ts.get("start", 0)) + t_start,
+                                                "end": float(ts.get("end", 0)) + t_start,
+                                            }
+                                            for ts in timestamps
+                                        ]
+                                        return _segments_to_chunks(normalized)
+                                    return _seg_to_chunks(t_text, t_start, t_end)
+                            except Exception as e:
+                                print(f"[transcribe] seg {i}: {e}")
+                            finally:
+                                Path(seg_path).unlink(missing_ok=True)
+                            return []
+
+                    tasks = [asyncio.create_task(transcribe_seg(*seg)) for seg in segs]
+
+                    for i, task in enumerate(tasks):
+                        yield _sse({"type": "status", "message": f"🎙️ Transcribing part {i + 1} of {num_segs}..."})
+                        try:
+                            seg_chunks = await task
+                            for chunk in seg_chunks:
+                                all_chunks.append(chunk)
+                                yield _sse({"type": "chunk", "chunk": chunk})
+                        except Exception as e:
+                            print(f"[stream] task {i} error: {e}")
+
+                # ── Save + done ────────────────────────────────────────────
+                if not all_chunks:
+                    yield _sse({"type": "error", "message": "Transcription returned empty result. The video may have no speech, or the transcription service may be temporarily unavailable."})
+                    yield "data: [DONE]\n\n"
+                    return
+
                 try:
                     store.save_video(vid_id, url)
-                    store.save_chunks(vid_id, transcript_chunks)
+                    store.save_chunks(vid_id, all_chunks)
                 except Exception as e:
                     print(f"[save] error: {e}")
+
                 yield _sse({"type": "done", "video_id": vid_id})
                 yield "data: [DONE]\n\n"
-                return
 
-            # ── Fall back: yt-dlp download + Sarvam STT ───────────────────
-            yield _sse({"type": "status", "message": "⬇️ No captions found — downloading audio..."})
-
-            all_chunks: List[dict] = []  # defined before with-block so it's always in scope
-
-            with tempfile.TemporaryDirectory() as tmp:
-                audio_path = os.path.join(tmp, "audio.wav")
-                try:
-                    duration = await _download_yt_audio(url, audio_path)
-                except Exception as e:
-                    # Catches HTTPException and any subprocess / OS errors
-                    msg = e.detail if isinstance(e, HTTPException) else str(e)
-                    yield _sse({"type": "error", "message": msg[:400]})
-                    yield "data: [DONE]\n\n"
-                    return
-
-                if not Path(audio_path).exists():
-                    yield _sse({"type": "error", "message": "Audio extraction produced no file"})
-                    yield "data: [DONE]\n\n"
-                    return
-
-                # ── Split ALL segments in one ffmpeg call (much faster than N calls) ──
-                yield _sse({"type": "status", "message": "✂️ Splitting audio..."})
-                seg_pattern = os.path.join(tmp, "seg%03d.wav")
-                await _exec([
-                    FFMPEG_BIN, "-y", "-i", audio_path,
-                    "-f", "segment", "-segment_time", str(SEG_DURATION),
-                    "-reset_timestamps", "1", "-ar", "16000", "-ac", "1",
-                    seg_pattern, "-loglevel", "quiet",
-                ])
-
-                # Collect what was produced
-                segs: List[tuple] = []
-                idx = 0
-                while True:
-                    sp = os.path.join(tmp, f"seg{idx:03d}.wav")
-                    if not Path(sp).exists():
-                        break
-                    t_start = idx * SEG_DURATION
-                    t_end   = min(t_start + SEG_DURATION, duration)
-                    if Path(sp).stat().st_size > 500:
-                        segs.append((idx, t_start, t_end, sp))
-                    idx += 1
-
-                if not segs:
-                    yield _sse({"type": "error", "message": "Audio splitting produced no segments."})
-                    yield "data: [DONE]\n\n"
-                    return
-
-                num_segs = len(segs)
-
-                # ── Transcribe segments with limited concurrency ──────────────
-                # Semaphore caps concurrent Sarvam API calls; ffmpeg is already done.
-                sarvam_sem = asyncio.Semaphore(2)
-
-                async def transcribe_seg(i, t_start, t_end, seg_path):
-                    async with sarvam_sem:
-                        try:
-                            with open(seg_path, "rb") as f:
-                                audio_bytes = f.read()
-                            result = await sarvam_transcribe(audio_bytes, language_code="unknown")
-                            t_text = result.get("transcript", "")
-                            if t_text.strip():
-                                timestamps = result.get("timestamps", [])
-                                if timestamps:
-                                    normalized = [
-                                        {
-                                            "text": ts.get("text", ts.get("word", "")),
-                                            "start": float(ts.get("start", 0)) + t_start,
-                                            "end": float(ts.get("end", 0)) + t_start,
-                                        }
-                                        for ts in timestamps
-                                    ]
-                                    return _segments_to_chunks(normalized)
-                                return _seg_to_chunks(t_text, t_start, t_end)
-                        except Exception as e:
-                            print(f"[transcribe] seg {i}: {e}")
-                        finally:
-                            Path(seg_path).unlink(missing_ok=True)
-                        return []
-
-                # All tasks start immediately; semaphore controls concurrency
-                tasks = [asyncio.create_task(transcribe_seg(*seg)) for seg in segs]
-
-                # Yield results in segment order
-                for i, task in enumerate(tasks):
-                    yield _sse({"type": "status", "message": f"🎙️ Transcribing part {i + 1} of {num_segs}..."})
-                    try:
-                        seg_chunks = await task
-                        for chunk in seg_chunks:
-                            all_chunks.append(chunk)
-                            yield _sse({"type": "chunk", "chunk": chunk})
-                    except Exception as e:
-                        print(f"[stream] task {i} error: {e}")
-
-            # ── Save + done ────────────────────────────────────────────────
-            if not all_chunks:
-                yield _sse({"type": "error", "message": "Transcription returned empty result. The video may have no speech."})
-                yield "data: [DONE]\n\n"
-                return
-
-            try:
-                store.save_video(vid_id, url)
-                store.save_chunks(vid_id, all_chunks)
-            except Exception as e:
-                print(f"[save] error: {e}")
-
-            yield _sse({"type": "done", "video_id": vid_id})
-            yield "data: [DONE]\n\n"
+            finally:
+                if cookies_path:
+                    Path(cookies_path).unlink(missing_ok=True)
 
         except Exception as e:
             # Safety net — prevents unhandled exceptions from killing the SSE stream silently
@@ -592,9 +618,12 @@ async def speak_answer(req: SpeakRequest):
         raise HTTPException(400, "text is required")
     try:
         audio_b64 = await synthesize_speech(req.text, req.language, req.voice)
+        if not audio_b64:
+            return {"audio_base64": None}
         return {"audio_base64": audio_b64}
     except Exception as e:
-        raise HTTPException(500, f"TTS failed: {e}")
+        print(f"[TTS] failed: {e}")
+        return {"audio_base64": None}  # degrade gracefully — text answer still works
 
 
 @app.post("/api/fun-facts")

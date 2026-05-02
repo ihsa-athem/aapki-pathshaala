@@ -29,17 +29,24 @@ def _timestamps_to_segments(ts) -> List[dict]:
 
 def _transcribe_sync(audio_bytes: bytes, filename: str, language_code: str) -> dict:
     client = _get_client()
-    resp = client.speech_to_text.transcribe(
-        file=(filename, audio_bytes, "audio/wav"),
-        model="saaras:v3",
-        mode="transcribe",
-        language_code=language_code,
-    )
-    return {
-        "transcript": resp.transcript,
-        "timestamps": _timestamps_to_segments(resp.timestamps),
-        "language_code": resp.language_code or "en-IN",
-    }
+    try:
+        resp = client.speech_to_text.transcribe(
+            file=(filename, audio_bytes, "audio/wav"),
+            model="saaras:v3",
+            mode="transcribe",
+            language_code=language_code,
+        )
+        return {
+            "transcript": resp.transcript,
+            "timestamps": _timestamps_to_segments(resp.timestamps),
+            "language_code": resp.language_code or "en-IN",
+        }
+    except Exception as e:
+        err = str(e).lower()
+        if "429" in err or "rate" in err or "quota" in err or "limit" in err or "exceeded" in err:
+            print(f"[sarvam-stt] rate limit hit: {e}")
+            return {"transcript": "", "timestamps": [], "language_code": "en-IN"}
+        raise
 
 
 async def transcribe_audio(

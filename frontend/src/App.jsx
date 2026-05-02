@@ -569,10 +569,10 @@ function friendlyError(msg = '') {
     return '🔒 CORS error — The backend needs to allow your frontend domain (check ALLOWED_ORIGINS in Railway)'
   if (m.includes('404') || m.includes('not found'))
     return '🔍 Video not found — कृपया YouTube URL check करें'
-  // 429 = YouTube is blocking the server's IP (common on cloud providers like Railway)
-  // The fix is to add YOUTUBE_COOKIES in Railway env vars — tell the user clearly.
-  if (m.includes('429') || m.includes('too many requests'))
-    return '🚫 YouTube is rate-limiting the server (HTTP 429). Fix: add YOUTUBE_COOKIES to Railway environment variables. See README for instructions.'
+  // 429 = YouTube blocks requests from datacenter IPs (Railway, Vercel, etc.).
+  // One-time fix: export cookies from your browser and set YOUTUBE_COOKIES in Railway.
+  if (m.includes('429') || m.includes('rate-limiting') || m.includes('too many requests'))
+    return '🚫 YouTube is blocking this server (HTTP 429 — datacenter IP). One-time fix: set YOUTUBE_COOKIES in your Railway environment variables. See the README for instructions.'
   // Other yt-dlp errors — show the actual reason rather than blaming the URL
   if (m.includes('yt-dlp error'))
     return `⬇️ Video download failed — ${msg.replace(/^yt-dlp error[:\s]*/i, '').trim().slice(0, 150)}`
