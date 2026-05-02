@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import wave
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import imageio_ffmpeg
 import json
