@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import math
 import os
 import subprocess
 import tempfile
@@ -21,7 +22,7 @@ FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
 
 load_dotenv()
 
-from claude_tutor import answer_question_stream
+from claude_tutor import answer_question_stream, generate_chapters, generate_fun_facts, generate_lesson_pack, generate_quiz, translate_transcript
 from sarvam import synthesize_speech
 from sarvam import transcribe_audio as sarvam_transcribe
 from sarvam import transcribe_question as sarvam_transcribe_question
@@ -56,10 +57,37 @@ class AskRequest(BaseModel):
     question: str
     video_id: str
     language: str = "en"
+    answer_language: str = "auto"   # "auto" | "en" | "hi"
+    class_level: int = 7
 
 
 class SpeakRequest(BaseModel):
     text: str
+    language: str = "en"
+    voice: str = "meera"   # Sarvam speaker name tied to persona
+
+
+class QuizRequest(BaseModel):
+    video_id: str
+    language: str = "en"
+
+
+class ChaptersRequest(BaseModel):
+    video_id: str
+
+
+class TranslateRequest(BaseModel):
+    text: str
+    target_language: str = "en"   # "en" or "hi"
+    style: str = "standard"        # "standard" or "simple"
+
+
+class FunFactsRequest(BaseModel):
+    video_id: str
+
+
+class LessonPackRequest(BaseModel):
+    video_id: str
     language: str = "en"
 
 
@@ -92,7 +120,9 @@ async def _download_yt_audio(url: str, out_path: str) -> float:
     # a JS runtime or PO tokens. The "JS runtime" warning is non-fatal —
     # audio formats still extract.
     cmd = [
-        "yt-dlp", "-x",
+        "yt-dlp",
+        "--format", "bestaudio[ext=m4a]/bestaudio/best",
+        "-x",
         "--audio-format", "wav",
         "--postprocessor-args", "ffmpeg:-ar 16000 -ac 1",
         "--ffmpeg-location", FFMPEG_BIN,
@@ -158,6 +188,27 @@ def _text_to_timed_chunks(text: str, duration: float) -> List[dict]:
     return chunks
 
 
+def _seg_to_chunks(text: str, t_start: float, t_end: float) -> List[dict]:
+    """Build chunks for a single segment window, timestamps relative to t_start."""
+    words = text.split()
+    n = len(words) or 1
+    dur = t_end - t_start
+    chunks = []
+    for i in range(0, n, WORDS_PER_CHUNK):
+        w = words[i : i + WORDS_PER_CHUNK]
+        chunks.append({
+            "text": " ".join(w),
+            "start_time": t_start + (i / n) * dur,
+            "end_time": t_start + (min(i + WORDS_PER_CHUNK, n) / n) * dur,
+        })
+    return chunks
+
+
+def _sse(obj: dict) -> str:
+    # ensure_ascii=False keeps emojis as UTF-8 so the browser JSON.parse works
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
 async def _transcribe_full(audio_path: str, duration: float) -> Tuple[List[dict], str]:
     """Split audio into segments, transcribe each, return (segments, full_text)."""
     all_segs: List[dict] = []
@@ -211,36 +262,136 @@ async def load_video(req: LoadVideoRequest):
     url = req.video_url.strip()
     if not url:
         raise HTTPException(400, "video_url is required")
-
     vid_id = make_video_id(url)
-    if store.video_exists(vid_id):
-        return {"video_id": vid_id, "chunks": store.get_chunks(vid_id), "cached": True}
 
-    with tempfile.TemporaryDirectory() as tmp:
-        audio_path = os.path.join(tmp, "audio.wav")
-        duration = await _download_yt_audio(url, audio_path)
+    async def stream():
+        try:
+            # ── Cache hit ──────────────────────────────────────────────────
+            if store.video_exists(vid_id):
+                yield _sse({"type": "cached", "video_id": vid_id, "chunks": store.get_chunks(vid_id)})
+                yield "data: [DONE]\n\n"
+                return
 
-        if not Path(audio_path).exists():
-            raise HTTPException(500, "Audio extraction produced no file")
+            # ── Download ───────────────────────────────────────────────────
+            yield _sse({"type": "status", "message": "⬇️ Downloading audio..."})
 
-        segments, full_text = await _transcribe_full(audio_path, duration)
+            all_chunks: List[dict] = []  # defined before with-block so it's always in scope
 
-    if not segments and not full_text.strip():
-        raise HTTPException(500, "Transcription returned empty result")
+            with tempfile.TemporaryDirectory() as tmp:
+                audio_path = os.path.join(tmp, "audio.wav")
+                try:
+                    duration = await _download_yt_audio(url, audio_path)
+                except Exception as e:
+                    # Catches HTTPException and any subprocess / OS errors
+                    msg = e.detail if isinstance(e, HTTPException) else str(e)
+                    yield _sse({"type": "error", "message": msg[:400]})
+                    yield "data: [DONE]\n\n"
+                    return
 
-    if segments:
-        # Normalize segment shape
-        normalized = [
-            {"text": s.get("text", s.get("word", "")), "start": s.get("start", 0), "end": s.get("end", 0)}
-            for s in segments
-        ]
-        chunks = _segments_to_chunks(normalized)
-    else:
-        chunks = _text_to_timed_chunks(full_text, duration)
+                if not Path(audio_path).exists():
+                    yield _sse({"type": "error", "message": "Audio extraction produced no file"})
+                    yield "data: [DONE]\n\n"
+                    return
 
-    store.save_video(vid_id, url)
-    store.save_chunks(vid_id, chunks)
-    return {"video_id": vid_id, "chunks": chunks, "cached": False}
+                # ── Split ALL segments in one ffmpeg call (much faster than N calls) ──
+                yield _sse({"type": "status", "message": "✂️ Splitting audio..."})
+                seg_pattern = os.path.join(tmp, "seg%03d.wav")
+                await _exec([
+                    FFMPEG_BIN, "-y", "-i", audio_path,
+                    "-f", "segment", "-segment_time", str(SEG_DURATION),
+                    "-reset_timestamps", "1", "-ar", "16000", "-ac", "1",
+                    seg_pattern, "-loglevel", "quiet",
+                ])
+
+                # Collect what was produced
+                segs: List[tuple] = []
+                idx = 0
+                while True:
+                    sp = os.path.join(tmp, f"seg{idx:03d}.wav")
+                    if not Path(sp).exists():
+                        break
+                    t_start = idx * SEG_DURATION
+                    t_end   = min(t_start + SEG_DURATION, duration)
+                    if Path(sp).stat().st_size > 500:
+                        segs.append((idx, t_start, t_end, sp))
+                    idx += 1
+
+                if not segs:
+                    yield _sse({"type": "error", "message": "Audio splitting produced no segments."})
+                    yield "data: [DONE]\n\n"
+                    return
+
+                num_segs = len(segs)
+
+                # ── Transcribe segments with limited concurrency ──────────────
+                # Semaphore caps concurrent Sarvam API calls; ffmpeg is already done.
+                sarvam_sem = asyncio.Semaphore(2)
+
+                async def transcribe_seg(i, t_start, t_end, seg_path):
+                    async with sarvam_sem:
+                        try:
+                            with open(seg_path, "rb") as f:
+                                audio_bytes = f.read()
+                            result = await sarvam_transcribe(audio_bytes, language_code="unknown")
+                            t_text = result.get("transcript", "")
+                            if t_text.strip():
+                                timestamps = result.get("timestamps", [])
+                                if timestamps:
+                                    normalized = [
+                                        {
+                                            "text": ts.get("text", ts.get("word", "")),
+                                            "start": float(ts.get("start", 0)) + t_start,
+                                            "end": float(ts.get("end", 0)) + t_start,
+                                        }
+                                        for ts in timestamps
+                                    ]
+                                    return _segments_to_chunks(normalized)
+                                return _seg_to_chunks(t_text, t_start, t_end)
+                        except Exception as e:
+                            print(f"[transcribe] seg {i}: {e}")
+                        finally:
+                            Path(seg_path).unlink(missing_ok=True)
+                        return []
+
+                # All tasks start immediately; semaphore controls concurrency
+                tasks = [asyncio.create_task(transcribe_seg(*seg)) for seg in segs]
+
+                # Yield results in segment order
+                for i, task in enumerate(tasks):
+                    yield _sse({"type": "status", "message": f"🎙️ Transcribing part {i + 1} of {num_segs}..."})
+                    try:
+                        seg_chunks = await task
+                        for chunk in seg_chunks:
+                            all_chunks.append(chunk)
+                            yield _sse({"type": "chunk", "chunk": chunk})
+                    except Exception as e:
+                        print(f"[stream] task {i} error: {e}")
+
+            # ── Save + done ────────────────────────────────────────────────
+            if not all_chunks:
+                yield _sse({"type": "error", "message": "Transcription returned empty result. The video may have no speech."})
+                yield "data: [DONE]\n\n"
+                return
+
+            try:
+                store.save_video(vid_id, url)
+                store.save_chunks(vid_id, all_chunks)
+            except Exception as e:
+                print(f"[save] error: {e}")
+
+            yield _sse({"type": "done", "video_id": vid_id})
+            yield "data: [DONE]\n\n"
+
+        except Exception as e:
+            # Safety net — prevents unhandled exceptions from killing the SSE stream silently
+            print(f"[stream] unhandled error: {type(e).__name__}: {e}")
+            try:
+                yield _sse({"type": "error", "message": f"Server error: {type(e).__name__}: {str(e)[:200]}"})
+                yield "data: [DONE]\n\n"
+            except Exception:
+                pass
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 @app.post("/api/ask")
@@ -252,8 +403,10 @@ async def ask_question(req: AskRequest):
     if not chunks:
         chunks = store.get_chunks(req.video_id)[:3]
 
+    resp_lang = req.language if req.answer_language == "auto" else req.answer_language
+
     async def sse():
-        async for token in answer_question_stream(req.question, chunks, req.language):
+        async for token in answer_question_stream(req.question, chunks, resp_lang, req.class_level):
             yield f"data: {json.dumps({'text': token})}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -287,10 +440,78 @@ async def speak_answer(req: SpeakRequest):
     if not req.text.strip():
         raise HTTPException(400, "text is required")
     try:
-        audio_b64 = await synthesize_speech(req.text, req.language)
+        audio_b64 = await synthesize_speech(req.text, req.language, req.voice)
         return {"audio_base64": audio_b64}
     except Exception as e:
         raise HTTPException(500, f"TTS failed: {e}")
+
+
+@app.post("/api/fun-facts")
+async def fun_facts_route(req: FunFactsRequest):
+    if not store.video_exists(req.video_id):
+        raise HTTPException(404, "Video not found.")
+    chunks = store.get_chunks(req.video_id)
+    if not chunks:
+        return {"facts": []}
+    try:
+        facts = await generate_fun_facts(chunks)
+        return {"facts": facts}
+    except Exception as e:
+        print(f"[fun-facts] {e}")
+        return {"facts": []}   # non-critical — silent failure
+
+
+@app.post("/api/lesson-pack")
+async def lesson_pack(req: LessonPackRequest):
+    if not store.video_exists(req.video_id):
+        raise HTTPException(404, "Video not found. Load the video first.")
+    chunks = store.get_chunks(req.video_id)
+    if not chunks:
+        raise HTTPException(400, "No transcript available.")
+    try:
+        result = await generate_lesson_pack(chunks, req.language)
+        return result
+    except Exception as e:
+        raise HTTPException(500, f"Lesson pack generation failed: {e}")
+
+
+@app.post("/api/translate")
+async def translate(req: TranslateRequest):
+    if not req.text.strip():
+        raise HTTPException(400, "text is required")
+    try:
+        translation = await translate_transcript(req.text, req.target_language, req.style)
+        return {"translation": translation}
+    except Exception as e:
+        raise HTTPException(500, f"Translation failed: {e}")
+
+
+@app.post("/api/chapters")
+async def chapters(req: ChaptersRequest):
+    if not store.video_exists(req.video_id):
+        raise HTTPException(404, "Video not found.")
+    chunks = store.get_chunks(req.video_id)
+    if not chunks:
+        raise HTTPException(400, "No transcript available.")
+    try:
+        result = await generate_chapters(chunks)
+        return {"chapters": result}
+    except Exception as e:
+        raise HTTPException(500, f"Chapter generation failed: {e}")
+
+
+@app.post("/api/quiz")
+async def quiz(req: QuizRequest):
+    if not store.video_exists(req.video_id):
+        raise HTTPException(404, "Video not found. Load the video first.")
+    chunks = store.get_chunks(req.video_id)
+    if not chunks:
+        raise HTTPException(400, "No transcript available for this video.")
+    try:
+        questions = await generate_quiz(chunks, req.language)
+        return {"questions": questions}
+    except Exception as e:
+        raise HTTPException(500, f"Quiz generation failed: {e}")
 
 
 @app.get("/health")

@@ -1,5 +1,8 @@
 import asyncio
+import base64
+import io
 import os
+import wave
 from typing import List
 
 from sarvamai import SarvamAI
@@ -18,13 +21,10 @@ def _timestamps_to_segments(ts) -> List[dict]:
     """Convert Sarvam's parallel-array timestamps into [{text, start, end}] segments."""
     if ts is None:
         return []
-    words = ts.words or []
+    words  = ts.words or []
     starts = ts.start_time_seconds or []
-    ends = ts.end_time_seconds or []
-    return [
-        {"text": w, "start": s, "end": e}
-        for w, s, e in zip(words, starts, ends)
-    ]
+    ends   = ts.end_time_seconds or []
+    return [{"text": w, "start": s, "end": e} for w, s, e in zip(words, starts, ends)]
 
 
 def _transcribe_sync(audio_bytes: bytes, filename: str, language_code: str) -> dict:
@@ -48,48 +48,80 @@ async def transcribe_audio(
     filename: str = "audio.wav",
 ) -> dict:
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None, _transcribe_sync, audio_bytes, filename, language_code
-    )
+    return await loop.run_in_executor(None, _transcribe_sync, audio_bytes, filename, language_code)
 
 
-async def transcribe_question(
-    audio_bytes: bytes,
-    filename: str = "question.wav",
-) -> dict:
+async def transcribe_question(audio_bytes: bytes, filename: str = "question.wav") -> dict:
     """Transcribe a student's voice question; auto-detects Hindi vs English."""
     return await transcribe_audio(audio_bytes, language_code="unknown", filename=filename)
 
 
-# ── TTS helper ────────────────────────────────────────────────────────────────
+# ── TTS helpers ───────────────────────────────────────────────────────────────
 
-def _tts_sync(text: str, language: str) -> str:
-    if language == "hi":
-        lang_code, speaker = "hi-IN", "manisha"
-    else:
-        lang_code, speaker = "en-IN", "abhilash"
+def _combine_wav_b64(audios: List[str]) -> str:
+    """Concatenate multiple base64-encoded WAV chunks into one seamless WAV."""
+    if not audios:
+        return ""
+    if len(audios) == 1:
+        return audios[0]
 
-    client = _get_client()
-    chunks = [text[i : i + MAX_TTS_CHARS] for i in range(0, len(text), MAX_TTS_CHARS)]
+    all_frames: List[bytes] = []
+    params = None
 
-    for chunk in chunks:
-        resp = client.text_to_speech.convert(
-            text=chunk,
-            target_language_code=lang_code,
-            speaker=speaker,
-            pitch=0,
-            pace=1.0,
-            loudness=1.5,
-            speech_sample_rate=8000,
-            enable_preprocessing=True,
-            model="bulbul:v2",
-        )
-        if resp.audios:
-            return resp.audios[0]  # return first chunk's audio
-    return ""
+    for b64 in audios:
+        try:
+            raw = base64.b64decode(b64)
+            with wave.open(io.BytesIO(raw), "rb") as w:
+                if params is None:
+                    params = w.getparams()
+                all_frames.append(w.readframes(w.getnframes()))
+        except Exception:
+            continue  # skip malformed chunk rather than failing everything
+
+    if not all_frames or params is None:
+        return audios[0]  # fallback: first chunk
+
+    out = io.BytesIO()
+    with wave.open(out, "wb") as w:
+        w.setparams(params)
+        for frames in all_frames:
+            w.writeframes(frames)
+
+    return base64.b64encode(out.getvalue()).decode()
 
 
-async def synthesize_speech(text: str, language: str = "en") -> str:
-    """Return base64-encoded WAV audio from Sarvam TTS."""
+def _tts_sync(text: str, language: str, voice: str = "manisha") -> str:
+    lang_code = "hi-IN" if language == "hi" else "en-IN"
+    client    = _get_client()
+
+    # Split into ≤500-char pieces (Sarvam per-input limit)
+    pieces = [text[i : i + MAX_TTS_CHARS] for i in range(0, len(text), MAX_TTS_CHARS)]
+
+    all_audios: List[str] = []
+    for piece in pieces:
+        if not piece.strip():
+            continue
+        try:
+            resp = client.text_to_speech.convert(
+                text=piece,
+                target_language_code=lang_code,
+                speaker=voice,
+                pitch=0,
+                pace=1.0,
+                loudness=1.5,
+                speech_sample_rate=8000,
+                enable_preprocessing=True,
+                model="bulbul:v2",
+            )
+            if resp.audios:
+                all_audios.extend(resp.audios)
+        except Exception as e:
+            print(f"[TTS] chunk failed: {e}")
+
+    return _combine_wav_b64(all_audios)
+
+
+async def synthesize_speech(text: str, language: str = "en", voice: str = "manisha") -> str:
+    """Return base64-encoded WAV audio (full answer, all chunks joined)."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _tts_sync, text, language)
+    return await loop.run_in_executor(None, _tts_sync, text, language, voice)

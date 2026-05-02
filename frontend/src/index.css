@@ -8,8 +8,52 @@ html, body, #root {
   padding: 0;
 }
 
-* {
-  box-sizing: border-box;
+* { box-sizing: border-box; }
+
+/* Global font: Inter for Latin, Hind for Devanagari.
+   The browser automatically picks Hind for any character Inter can't render
+   (i.e. all Devanagari/Hindi text). */
+body {
+  font-family: 'Inter', 'Hind', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* Force Hind for any element explicitly marked as Hindi (fallback for edge cases) */
+[lang="hi"], .font-hi {
+  font-family: 'Hind', system-ui, sans-serif;
+}
+
+/* Cleaner selection colour */
+::selection { background: #c7d2fe; color: #1e1b4b; }
+
+/* ── Entrance animations ──────────────────────────────── */
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position:  200% 0; }
+}
+
+.fade-in-up  { animation: fadeInUp 0.4s ease-out both; }
+.fade-in     { animation: fadeIn   0.3s ease-out both; }
+
+/* Staggered children — add style="--i:N" for N=0,1,2… */
+.stagger { animation: fadeInUp 0.4s ease-out both; animation-delay: calc(var(--i, 0) * 60ms); }
+
+/* Shimmer skeleton */
+.skeleton {
+  background: linear-gradient(90deg, #e2e8f0 25%, #f1f5f9 50%, #e2e8f0 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s infinite;
+  border-radius: 4px;
 }
 
 /* Smooth scrollbar for transcript and chat panels */
@@ -20,3 +64,60 @@ html, body, #root {
 .scrollbar-thin::-webkit-scrollbar { width: 6px; }
 .scrollbar-thin::-webkit-scrollbar-track { background: #f8fafc; }
 .scrollbar-thin::-webkit-scrollbar-thumb { background-color: #c7d2fe; border-radius: 3px; }
+
+/* ── Translation loading animations ──────────────────────────────── */
+
+/* Book page turning */
+@keyframes pageFlap {
+  0%, 100% { transform: scaleX(1);   opacity: 0.85; }
+  38%       { transform: scaleX(0.1); opacity: 0.3;  }
+  62%       { transform: scaleX(0.1); opacity: 0.3;  }
+}
+
+/* Pencil bob */
+@keyframes pencilBob {
+  0%, 100% { transform: translateY(0) rotate(-8deg); }
+  50%       { transform: translateY(-6px) rotate(-8deg); }
+}
+
+/* Simulated translation progress (fills to ~93% then stops awaiting completion) */
+@keyframes translationProgress {
+  0%   { width: 2%;  }
+  12%  { width: 28%; }
+  35%  { width: 55%; }
+  60%  { width: 74%; }
+  80%  { width: 85%; }
+  95%  { width: 92%; }
+  100% { width: 93%; }
+}
+
+/* Staggered transcript line entrance after translation */
+@keyframes transcriptLineIn {
+  from { opacity: 0; transform: translateY(7px); }
+  to   { opacity: 1; transform: translateY(0);   }
+}
+.transcript-line-in {
+  animation: transcriptLineIn 0.38s ease-out both;
+  opacity: 0;
+}
+
+/* ── Print styles for Teacher Dashboard PDF export ─────────────────── */
+@media print {
+  * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+
+  body { margin: 0; background: white; }
+
+  /* Hide all non-print elements */
+  .no-print { display: none !important; }
+
+  /* Show only the printable lesson pack */
+  .teacher-print-root { padding: 0 !important; background: white !important; }
+  .teacher-print-root .no-print { display: none !important; }
+
+  /* Section cards */
+  .print-card { break-inside: avoid; margin-bottom: 24pt; }
+  .print-page-break { break-before: page; }
+
+  /* Quiz items — keep each question together */
+  .quiz-item { break-inside: avoid; }
+}

@@ -1,21 +1,36 @@
-# Secrets
+# ── Secrets ────────────────────────────────────────────────────────────────────
 .env
 *.env.local
+*.env.*.local
 
-# Python
+# ── Python ─────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
+*.pyc
 .venv/
 venv/
 *.egg-info/
+dist/
+build/
 
-# DB
-transcripts.db
+# ── Databases ──────────────────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
 
-# Node
+# ── Node / Frontend ────────────────────────────────────────────────────────────
 node_modules/
 frontend/dist/
+frontend/.env
+frontend/.env.local
 
-# OS
+# ── OS ─────────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# ── Editors ────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
