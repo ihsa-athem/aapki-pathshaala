@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import wave
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import imageio_ffmpeg
 import json
@@ -329,6 +329,68 @@ async def _transcribe_full(audio_path: str, duration: float) -> Tuple[List[dict]
     return all_segs, " ".join(text_parts)
 
 
+# ── YouTube Transcript API helpers ───────────────────────────────────────────
+
+def _extract_video_id(url: str) -> Optional[str]:
+    import re
+    m = re.search(r'(?:v=|youtu\.be/|embed/)([^&\n?#]+)', url)
+    return m.group(1) if m else None
+
+
+async def _fetch_youtube_transcript(url: str) -> List[dict]:
+    """Fetch YouTube captions via transcript API without downloading video.
+    Returns [] if the video has no captions or the API call fails."""
+    video_id = _extract_video_id(url)
+    if not video_id:
+        return []
+
+    loop = asyncio.get_event_loop()
+
+    def _sync_fetch() -> List[dict]:
+        try:
+            from youtube_transcript_api import YouTubeTranscriptApi
+            # Prefer English; accept Hindi and Indian variants too
+            entries = YouTubeTranscriptApi.get_transcript(
+                video_id,
+                languages=["en", "en-IN", "hi", "hi-IN"],
+            )
+            chunks: List[dict] = []
+            buf_words: List[str] = []
+            buf_start: Optional[float] = None
+            buf_end: float = 0.0
+            for entry in entries:
+                text = entry.get("text", "").strip()
+                if not text:
+                    continue
+                start = float(entry.get("start", 0))
+                dur   = float(entry.get("duration", 2))
+                end   = start + dur
+                if buf_start is None:
+                    buf_start = start
+                buf_end = end
+                buf_words.append(text)
+                if sum(len(w.split()) for w in buf_words) >= WORDS_PER_CHUNK:
+                    chunks.append({
+                        "text": " ".join(buf_words),
+                        "start_time": buf_start,
+                        "end_time": buf_end,
+                    })
+                    buf_words, buf_start = [], None
+            if buf_words:
+                chunks.append({
+                    "text": " ".join(buf_words),
+                    "start_time": buf_start or 0.0,
+                    "end_time": buf_end,
+                })
+            print(f"[transcript-api] {len(chunks)} chunks for {video_id}")
+            return chunks
+        except Exception as e:
+            print(f"[transcript-api] failed for {video_id}: {e}")
+            return []
+
+    return await loop.run_in_executor(None, _sync_fetch)
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.post("/api/load-video")
@@ -346,8 +408,23 @@ async def load_video(req: LoadVideoRequest):
                 yield "data: [DONE]\n\n"
                 return
 
-            # ── Download ───────────────────────────────────────────────────
-            yield _sse({"type": "status", "message": "⬇️ Downloading audio..."})
+            # ── Try YouTube Transcript API first (fast, no 429 risk) ──────
+            yield _sse({"type": "status", "message": "📄 Fetching transcript..."})
+            transcript_chunks = await _fetch_youtube_transcript(url)
+            if transcript_chunks:
+                for chunk in transcript_chunks:
+                    yield _sse({"type": "chunk", "chunk": chunk})
+                try:
+                    store.save_video(vid_id, url)
+                    store.save_chunks(vid_id, transcript_chunks)
+                except Exception as e:
+                    print(f"[save] error: {e}")
+                yield _sse({"type": "done", "video_id": vid_id})
+                yield "data: [DONE]\n\n"
+                return
+
+            # ── Fall back: yt-dlp download + Sarvam STT ───────────────────
+            yield _sse({"type": "status", "message": "⬇️ No captions found — downloading audio..."})
 
             all_chunks: List[dict] = []  # defined before with-block so it's always in scope
 
