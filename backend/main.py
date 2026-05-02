@@ -8,6 +8,7 @@ import wave
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import httpx
 import imageio_ffmpeg
 import json
 import uvicorn
@@ -439,6 +440,74 @@ def _parse_json3_subtitles(path: Path) -> List[dict]:
         return []
 
 
+async def _fetch_supadata_transcript(url: str) -> Optional[List[dict]]:
+    """Fetch YouTube transcript via Supadata API (works from any IP, no cookies needed).
+
+    Get a free key at https://supadata.ai → set SUPADATA_API_KEY in Railway.
+
+    Returns:
+        List[dict]  — transcript chunks
+        []          — not configured or video has no transcript
+        None        — Supadata API error / rate limited
+    """
+    api_key = os.getenv("SUPADATA_API_KEY", "").strip()
+    if not api_key:
+        return []  # not configured — skip silently
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                "https://api.supadata.ai/v1/youtube/transcript",
+                headers={"x-api-key": api_key},
+                params={"url": url},
+            )
+
+        if resp.status_code == 404:
+            print("[supadata] no transcript available for this video")
+            return []
+        if resp.status_code == 429:
+            print("[supadata] rate limited")
+            return None
+        if resp.status_code != 200:
+            print(f"[supadata] error {resp.status_code}: {resp.text[:200]}")
+            return []
+
+        data = resp.json()
+        content = data.get("content", [])
+        if not content:
+            return []
+
+        # Each item: {"text": str, "offset": ms, "duration": ms}
+        chunks: List[dict] = []
+        buf_words: List[str] = []
+        buf_start: Optional[float] = None
+        buf_end: float = 0.0
+
+        for item in content:
+            text = item.get("text", "").strip()
+            if not text:
+                continue
+            start = item.get("offset", 0) / 1000.0
+            end   = start + item.get("duration", 2000) / 1000.0
+            if buf_start is None:
+                buf_start = start
+            buf_end = end
+            buf_words.append(text)
+            if sum(len(w.split()) for w in buf_words) >= WORDS_PER_CHUNK:
+                chunks.append({"text": " ".join(buf_words), "start_time": buf_start, "end_time": buf_end})
+                buf_words, buf_start = [], None
+
+        if buf_words:
+            chunks.append({"text": " ".join(buf_words), "start_time": buf_start or 0.0, "end_time": buf_end})
+
+        print(f"[supadata] {len(chunks)} chunks")
+        return chunks
+
+    except Exception as e:
+        print(f"[supadata] exception: {e}")
+        return []
+
+
 async def _fetch_yt_subtitles(url: str, cookies_path: Optional[str] = None) -> Optional[List[dict]]:
     """Download subtitle file via yt-dlp --skip-download (android_vr API, no video download).
 
@@ -510,10 +579,25 @@ async def load_video(req: LoadVideoRequest):
             # ── Get cookies once — passed to both transcript API and yt-dlp
             cookies_path = _get_cookies_path()
             try:
-                # ── 1. YouTube Transcript API (fast, no subprocess overhead) ──
                 yield _sse({"type": "status", "message": "📄 Fetching transcript..."})
-                t_result = await _fetch_youtube_transcript(url, cookies_path)
 
+                # ── 1. Supadata API (works from any IP — most reliable) ────────
+                # Set SUPADATA_API_KEY in Railway env vars (free at supadata.ai).
+                sd_result = await _fetch_supadata_transcript(url)
+                if sd_result:
+                    for chunk in sd_result:
+                        yield _sse({"type": "chunk", "chunk": chunk})
+                    try:
+                        store.save_video(vid_id, url)
+                        store.save_chunks(vid_id, sd_result)
+                    except Exception as e:
+                        print(f"[save] error: {e}")
+                    yield _sse({"type": "done", "video_id": vid_id})
+                    yield "data: [DONE]\n\n"
+                    return
+
+                # ── 2. youtube-transcript-api (free, no key needed) ────────────
+                t_result = await _fetch_youtube_transcript(url, cookies_path)
                 if t_result:
                     for chunk in t_result:
                         yield _sse({"type": "chunk", "chunk": chunk})
@@ -526,16 +610,14 @@ async def load_video(req: LoadVideoRequest):
                     yield "data: [DONE]\n\n"
                     return
 
-                # ── 2. yt-dlp subtitle download (android_vr API — different path ──
-                # transcript-api uses the YouTube web page (gets 429 from datacenter IPs);
-                # yt-dlp uses the Android mobile API which bypasses that block.
+                # ── 3. yt-dlp subtitle-only download (android_vr API path) ─────
                 yield _sse({"type": "status", "message": "📥 Fetching subtitles..."})
                 sub_result = await _fetch_yt_subtitles(url, cookies_path)
 
                 if sub_result is None:
-                    # Both methods got blocked — nothing left to try
-                    hint = "" if cookies_path else " Set YOUTUBE_COOKIES in Railway env vars to fix this."
-                    yield _sse({"type": "error", "message": f"429: YouTube is blocking this server.{hint}"})
+                    # All caption-fetching methods are IP-blocked.
+                    # Supadata (supadata.ai) is the reliable fix — see README.
+                    yield _sse({"type": "error", "message": "429: YouTube is blocking this server's IP. Set SUPADATA_API_KEY in Railway env vars (free at supadata.ai) for a permanent fix."})
                     yield "data: [DONE]\n\n"
                     return
 
@@ -551,8 +633,8 @@ async def load_video(req: LoadVideoRequest):
                     yield "data: [DONE]\n\n"
                     return
 
-                # ── 3. yt-dlp full audio download + Sarvam STT ───────────────
-                # Reached only for videos that have absolutely no captions/subtitles.
+                # ── 4. yt-dlp full audio download + Sarvam STT ───────────────
+                # Only reached for videos with absolutely no captions/subtitles.
                 yield _sse({"type": "status", "message": "⬇️ No captions — downloading audio..."})
 
                 all_chunks: List[dict] = []
