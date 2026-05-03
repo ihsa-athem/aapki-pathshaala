@@ -7,11 +7,9 @@ import anthropic
 
 _client: anthropic.AsyncAnthropic | None = None
 
-# Primary model: safe default that works on every Anthropic API key.
-# Override by setting CLAUDE_MODEL in Railway env vars if you want a newer model.
-_PRIMARY = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
-# Fallback tried automatically if the primary model returns a model-not-found error.
-_FALLBACK = "claude-3-5-sonnet-20241022"
+# Current Anthropic models (as of 2026). Override with CLAUDE_MODEL in Railway if needed.
+_PRIMARY  = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+_FALLBACK = "claude-haiku-4-5-20251001"
 
 
 def _get_client() -> anthropic.AsyncAnthropic:
