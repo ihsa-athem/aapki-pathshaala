@@ -201,10 +201,13 @@ export default function App() {
     e.preventDefault()
     const container = panelContainerRef.current
     if (!container) return
+    // Capture starting state once — delta approach so the handle never jumps on click
+    const startX = e.clientX
+    const startPct = leftPct
+    const containerWidth = container.getBoundingClientRect().width
     const onMove = (ev) => {
-      const rect = container.getBoundingClientRect()
-      const pct = ((ev.clientX - rect.left) / rect.width) * 100
-      setLeftPct(Math.max(22, Math.min(72, pct)))
+      const deltaPct = ((ev.clientX - startX) / containerWidth) * 100
+      setLeftPct(Math.max(22, Math.min(72, startPct + deltaPct)))
     }
     const onUp = () => {
       document.removeEventListener('mousemove', onMove)
@@ -212,7 +215,7 @@ export default function App() {
     }
     document.addEventListener('mousemove', onMove)
     document.addEventListener('mouseup', onUp)
-  }, [])
+  }, [leftPct])
 
   // Auto-load video when teacher shares a ?video= URL
   useEffect(() => {
