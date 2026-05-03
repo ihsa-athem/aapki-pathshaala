@@ -180,13 +180,39 @@ export default function App() {
     if (saved) return parseInt(saved, 10)
     return window.innerWidth < 768 ? 20 : 16   // mobile defaults large
   })
+  // Left panel width as a percentage — persisted so the user's preference is remembered
+  const [leftPct, setLeftPct] = useState(() => {
+    const saved = localStorage.getItem('aoh-panel-split')
+    return saved ? parseFloat(saved) : 42
+  })
+  const panelContainerRef = useRef(null)
   const playerRef = useRef(null)
 
-  // Apply font size to <html> so all rem-based Tailwind classes scale
   useEffect(() => {
     document.documentElement.style.fontSize = fontSize + 'px'
     localStorage.setItem('aoh-font-size', fontSize)
   }, [fontSize])
+
+  useEffect(() => {
+    localStorage.setItem('aoh-panel-split', leftPct)
+  }, [leftPct])
+
+  const handleSplitDrag = useCallback((e) => {
+    e.preventDefault()
+    const container = panelContainerRef.current
+    if (!container) return
+    const onMove = (ev) => {
+      const rect = container.getBoundingClientRect()
+      const pct = ((ev.clientX - rect.left) / rect.width) * 100
+      setLeftPct(Math.max(22, Math.min(72, pct)))
+    }
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }, [])
 
   // Auto-load video when teacher shares a ?video= URL
   useEffect(() => {
@@ -521,12 +547,29 @@ export default function App() {
         />
       ) : (
         <>
-          {/* Desktop: side-by-side */}
-          <div className="hidden md:flex flex-1 overflow-hidden">
-            <div className="w-1/2 flex flex-col h-full overflow-hidden">
+          {/* Desktop: side-by-side with draggable divider */}
+          <div ref={panelContainerRef} className="hidden md:flex flex-1 overflow-hidden select-none">
+            <div style={{ width: `${leftPct}%` }} className="flex flex-col h-full overflow-hidden flex-shrink-0 min-w-0">
               <VideoPanel {...videoPanelProps} />
             </div>
-            <div className="w-1/2 flex flex-col h-full overflow-hidden">
+
+            {/* Drag handle — grab and pull left/right to resize panels */}
+            <div
+              onMouseDown={handleSplitDrag}
+              className="w-1.5 flex-shrink-0 bg-gray-200 hover:bg-indigo-400 active:bg-indigo-500
+                         cursor-col-resize transition-colors duration-150 group relative"
+              title="Drag to resize"
+            >
+              <div className="absolute inset-y-0 left-1/2 -translate-x-1/2 w-4 flex flex-col
+                              items-center justify-center gap-0.5 opacity-0 group-hover:opacity-100
+                              transition-opacity pointer-events-none">
+                {[0,1,2,3,4].map(i => (
+                  <div key={i} className="w-0.5 h-3 bg-white/80 rounded-full" />
+                ))}
+              </div>
+            </div>
+
+            <div className="flex-1 flex flex-col h-full overflow-hidden min-w-0">
               <ChatPanel {...chatPanelProps} />
             </div>
           </div>
