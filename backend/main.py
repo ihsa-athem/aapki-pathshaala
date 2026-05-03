@@ -855,8 +855,14 @@ async def translate(req: TranslateRequest):
     try:
         translation = await translate_transcript(req.text, req.target_language, req.style)
         return {"translation": translation}
+    except RuntimeError as e:
+        # Includes "ANTHROPIC_API_KEY is not set" and "No Claude model could be reached"
+        raise HTTPException(503, str(e))
     except Exception as e:
-        raise HTTPException(500, f"Translation failed: {e}")
+        # Expose the real error — helps diagnose auth / model / rate-limit issues
+        err = str(e)
+        print(f"[translate] error: {err}")
+        raise HTTPException(500, err[:400])
 
 
 @app.post("/api/chapters")
@@ -889,7 +895,39 @@ async def quiz(req: QuizRequest):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "AI Office Hours API"}
+    """Checks each API key so Railway/user can diagnose misconfigurations fast."""
+    checks: dict = {}
+
+    # Anthropic
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    checks["anthropic_key_set"] = bool(anthropic_key)
+    if anthropic_key:
+        try:
+            import anthropic as _anthropic
+            c = _anthropic.AsyncAnthropic(api_key=anthropic_key)
+            await c.messages.create(
+                model=os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022"),
+                max_tokens=5,
+                messages=[{"role": "user", "content": "hi"}],
+            )
+            checks["anthropic"] = "ok"
+        except Exception as e:
+            checks["anthropic"] = str(e)[:120]
+    else:
+        checks["anthropic"] = "key not set"
+
+    # Sarvam
+    sarvam_key = os.getenv("SARVAM_API_KEY", "").strip()
+    checks["sarvam_key_set"] = bool(sarvam_key)
+    checks["sarvam"] = "ok" if sarvam_key else "key not set"
+
+    # Supadata
+    supadata_key = os.getenv("SUPADATA_API_KEY", "").strip()
+    checks["supadata_key_set"] = bool(supadata_key)
+    checks["supadata"] = "ok" if supadata_key else "key not set"
+
+    overall = "ok" if checks.get("anthropic") == "ok" else "degraded"
+    return {"status": overall, "service": "AI Office Hours API", "checks": checks}
 
 
 if __name__ == "__main__":

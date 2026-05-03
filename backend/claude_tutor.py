@@ -7,12 +7,50 @@ import anthropic
 
 _client: anthropic.AsyncAnthropic | None = None
 
+# Primary model: safe default that works on every Anthropic API key.
+# Override by setting CLAUDE_MODEL in Railway env vars if you want a newer model.
+_PRIMARY = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
+# Fallback tried automatically if the primary model returns a model-not-found error.
+_FALLBACK = "claude-3-5-sonnet-20241022"
+
 
 def _get_client() -> anthropic.AsyncAnthropic:
     global _client
     if _client is None:
-        _client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
+        key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+        if not key:
+            raise RuntimeError("ANTHROPIC_API_KEY is not set in environment variables.")
+        _client = anthropic.AsyncAnthropic(api_key=key)
     return _client
+
+
+def _is_model_error(e: Exception) -> bool:
+    """True when the error is 'model not found / not accessible' — safe to retry."""
+    s = str(e).lower()
+    return ("not_found" in s or "model" in s) and "404" in s
+
+
+async def _create(system: str, user: str, max_tokens: int) -> str:
+    """Non-streaming Claude call with automatic model fallback."""
+    client = _get_client()
+    models = list(dict.fromkeys([_PRIMARY, _FALLBACK]))  # deduplicated, primary first
+    last_err: Exception | None = None
+    for model in models:
+        try:
+            resp = await client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+            return resp.content[0].text.strip()
+        except Exception as e:
+            if _is_model_error(e):
+                print(f"[claude] model {model} not available, trying fallback: {e}")
+                last_err = e
+                continue
+            raise
+    raise last_err or RuntimeError("No Claude model could be reached.")
 
 
 SYSTEM_PROMPT = """\
@@ -53,6 +91,8 @@ def _build_context(chunks: List[dict]) -> str:
     return "\n\n".join(parts)
 
 
+# ── Translation ────────────────────────────────────────────────────────────────
+
 def _lang_label(target_language: str, style: str) -> str:
     if target_language == "hi":
         return "Hindi (Devanagari script)"
@@ -65,32 +105,25 @@ def _lang_label(target_language: str, style: str) -> str:
 
 
 async def _translate_batch(text: str, target_language: str, style: str) -> str:
-    client = _get_client()
     label = _lang_label(target_language, style)
-    resp = await client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=8192,
+    return await _create(
         system=(
             f"You are a translator. Translate the given transcript to {label}. "
             "Preserve every [mm:ss] timestamp marker exactly as it appears — "
             "do not translate, move, or remove them. Only translate the text between markers. "
             "Keep the same paragraph/newline structure."
         ),
-        messages=[{"role": "user", "content": f"Translate to {label}:\n\n{text}"}],
+        user=f"Translate to {label}:\n\n{text}",
+        max_tokens=8192,
     )
-    return resp.content[0].text.strip()
 
 
 async def translate_transcript(text: str, target_language: str = "en", style: str = "standard") -> str:
-    """Translate a timestamped transcript, preserving [mm:ss] markers.
-
-    Batches long transcripts (>20 paragraphs) to stay within max_tokens.
-    """
+    """Translate a timestamped transcript. Batches long transcripts automatically."""
     paragraphs = [p for p in text.split('\n\n') if p.strip()]
-    BATCH = 20  # ~4 000 words per call — well within 8 192 output tokens
+    BATCH = 20  # ~4 000 words — well within 8 192 output tokens
     if len(paragraphs) <= BATCH:
         return await _translate_batch(text, target_language, style)
-
     parts = []
     for i in range(0, len(paragraphs), BATCH):
         chunk = '\n\n'.join(paragraphs[i:i + BATCH])
@@ -98,28 +131,27 @@ async def translate_transcript(text: str, target_language: str = "en", style: st
     return '\n\n'.join(parts)
 
 
+# ── Fun facts ──────────────────────────────────────────────────────────────────
+
 async def generate_fun_facts(chunks: List[dict]) -> List[str]:
-    """Generate 3 fun facts about the video topic for display during translation loading."""
-    client = _get_client()
-    # Only need a few chunks to understand the topic
     context = _build_context(chunks[:6])
-    resp = await client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=400,
+    raw = await _create(
         system=(
             "Generate exactly 3 fun, surprising facts for school students about the topic in the text. "
             "Return ONLY a JSON array: [\"fact1\", \"fact2\", \"fact3\"]. "
             "Each fact must be under 70 words. Make them genuinely interesting and wow-worthy. "
             "No markdown, no extra text."
         ),
-        messages=[{"role": "user", "content": f"Generate 3 fun facts from this content:\n\n{context}"}],
+        user=f"Generate 3 fun facts from this content:\n\n{context}",
+        max_tokens=400,
     )
-    raw = resp.content[0].text.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     result = json.loads(raw)
     return result if isinstance(result, list) else []
 
+
+# ── Lesson pack ────────────────────────────────────────────────────────────────
 
 LESSON_PACK_SYSTEM = """\
 You are an educational content designer creating classroom materials for a teacher in India.
@@ -159,19 +191,18 @@ Rules:
 
 
 async def generate_lesson_pack(chunks: List[dict], language: str = "en") -> dict:
-    client = _get_client()
     context = _build_context(chunks)
-    resp = await client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=4096,
+    raw = await _create(
         system=LESSON_PACK_SYSTEM,
-        messages=[{"role": "user", "content": f"Generate a complete lesson pack for this transcript:\n\n{context}"}],
+        user=f"Generate a complete lesson pack for this transcript:\n\n{context}",
+        max_tokens=4096,
     )
-    raw = resp.content[0].text.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     return json.loads(raw)
 
+
+# ── Chapters ───────────────────────────────────────────────────────────────────
 
 CHAPTERS_SYSTEM = """\
 You analyze a video transcript to identify 4-6 logical chapter/topic breaks.
@@ -191,19 +222,18 @@ Rules:
 
 
 async def generate_chapters(chunks: List[dict]) -> List[dict]:
-    client = _get_client()
     context = _build_context(chunks)
-    resp = await client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=512,
+    raw = await _create(
         system=CHAPTERS_SYSTEM,
-        messages=[{"role": "user", "content": f"Generate chapter markers:\n\n{context}"}],
+        user=f"Generate chapter markers:\n\n{context}",
+        max_tokens=512,
     )
-    raw = resp.content[0].text.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     return json.loads(raw)
 
+
+# ── Quiz ───────────────────────────────────────────────────────────────────────
 
 QUIZ_SYSTEM = """\
 You are a quiz generator for educational video content.
@@ -232,73 +262,32 @@ Rules:
 
 
 async def generate_quiz(chunks: List[dict], language: str = "en") -> List[dict]:
-    client = _get_client()
     context = _build_context(chunks)
     lang_note = (
         "Generate all questions, options, and explanations in Hindi (Devanagari script)."
         if language == "hi"
         else "Generate in English."
     )
-    user_msg = f"{lang_note}\n\nTranscript:\n{context}"
-
-    resp = await client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2048,
+    raw = await _create(
         system=QUIZ_SYSTEM,
-        messages=[{"role": "user", "content": user_msg}],
+        user=f"{lang_note}\n\nTranscript:\n{context}",
+        max_tokens=2048,
     )
-    raw = resp.content[0].text.strip()
-    # Strip markdown code fences if Claude wraps the JSON
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     return json.loads(raw)
 
 
-# Concrete per-class instructions that Claude must follow — placed FIRST in the system prompt
-# so they take priority over the general rules.
+# ── Q&A streaming ──────────────────────────────────────────────────────────────
+
 _CLASS_INFO = {
-    4:  (9,  """\
-CLASS 4 STUDENT (age ~9). STRICT RULES:
-- Use ONLY very simple everyday words — no science/technical terms at all
-- MAX 2-3 short sentences in the whole answer
-- Explain like talking to a curious younger sibling
-- Compare everything to things kids love: cricket, cartoons, food, school friends
-- Example style: "Bilkul simple baat hai! Paani upar jaata hai kyunki suraj use garam karta hai, \
-jaise tawa pe roti phulti hai! ☀️ [1:20] pe dikha hai yeh."\
-"""),
-    5:  (10, """\
-CLASS 5 STUDENT (age ~10). STRICT RULES:
-- Simple friendly language — like a cool older didi/bhaiya explaining
-- MAX 3-4 sentences
-- No jargon; if you must use one term, explain it immediately in simple words
-- Use relatable comparisons (toys, games, school, family)\
-"""),
-    6:  (11, """\
-CLASS 6 STUDENT (age ~11). STRICT RULES:
-- Clear simple language; can introduce subject terms IF explained right away
-- MAX 4-5 sentences
-- Conversational and encouraging tone\
-"""),
-    7:  (12, """\
-CLASS 7 STUDENT (age ~12).
-- Friendly academic language; technical terms OK with brief explanation
-- 4-6 sentences\
-"""),
-    8:  (13, """\
-CLASS 8 STUDENT (age ~13).
-- Clear academic language; multi-step reasoning is fine
-- 5-7 sentences\
-"""),
-    9:  (14, """\
-CLASS 9 STUDENT (age ~14).
-- Standard academic language; board-exam relevant depth
-- 5-8 sentences\
-"""),
-    10: (15, """\
-CLASS 10 STUDENT (age ~15).
-- Full academic language; board-level depth and detail
-- Up to 8-10 sentences if the topic warrants it\
-"""),
+    4:  (9,  "CLASS 4 STUDENT (age ~9). STRICT RULES:\n- Use ONLY very simple everyday words\n- MAX 2-3 short sentences\n- Compare to things kids love: cricket, cartoons, food"),
+    5:  (10, "CLASS 5 STUDENT (age ~10). STRICT RULES:\n- Simple friendly language\n- MAX 3-4 sentences\n- No jargon; explain any term immediately"),
+    6:  (11, "CLASS 6 STUDENT (age ~11). STRICT RULES:\n- Clear simple language; introduce subject terms with explanation\n- MAX 4-5 sentences"),
+    7:  (12, "CLASS 7 STUDENT (age ~12).\n- Friendly academic language; technical terms OK with brief explanation\n- 4-6 sentences"),
+    8:  (13, "CLASS 8 STUDENT (age ~13).\n- Clear academic language; multi-step reasoning is fine\n- 5-7 sentences"),
+    9:  (14, "CLASS 9 STUDENT (age ~14).\n- Standard academic language; board-exam relevant depth\n- 5-8 sentences"),
+    10: (15, "CLASS 10 STUDENT (age ~15).\n- Full academic language; board-level depth and detail\n- Up to 8-10 sentences if the topic warrants it"),
 }
 
 
@@ -310,23 +299,34 @@ async def answer_question_stream(
 ) -> AsyncIterator[str]:
     client = _get_client()
     context = _build_context(chunks)
-
     _, class_instruction = _CLASS_INFO.get(class_level, _CLASS_INFO[7])
-
-    # Class instruction goes FIRST — highest priority for Claude
     lang_directive = (
         "Respond in Hindi (Devanagari)." if language == "hi"
         else "Respond in English. Hinglish is fine if the student mixed languages."
     )
     full_system = f"{class_instruction}\n\nLANGUAGE: {lang_directive}\n\n{SYSTEM_PROMPT}"
-
     user_msg = f"Transcript excerpts:\n\n{context}\n\nStudent question: {question}"
 
-    async with client.messages.stream(
-        model="claude-sonnet-4-6",
-        max_tokens=1024,
-        system=full_system,
-        messages=[{"role": "user", "content": user_msg}],
-    ) as stream:
-        async for text in stream.text_stream:
-            yield text
+    models = list(dict.fromkeys([_PRIMARY, _FALLBACK]))
+    last_err: Exception | None = None
+    for model in models:
+        yielded = False
+        try:
+            async with client.messages.stream(
+                model=model,
+                max_tokens=1024,
+                system=full_system,
+                messages=[{"role": "user", "content": user_msg}],
+            ) as stream:
+                async for text in stream.text_stream:
+                    yielded = True
+                    yield text
+            return
+        except Exception as e:
+            if not yielded and _is_model_error(e):
+                print(f"[claude] stream model {model} not available, trying fallback")
+                last_err = e
+                continue
+            raise
+    if last_err:
+        raise last_err

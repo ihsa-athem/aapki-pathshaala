@@ -187,7 +187,7 @@ export default function VideoPanel({ youtubeId, chunks, isLoading, language, onS
     } catch (e) {
       console.error('Translate failed:', e)
       setTranscriptLang('original')
-      setTranslationError('Translation failed — check that ANTHROPIC_API_KEY is set in Railway.')
+      setTranslationError(`Translation failed: ${e.message}`)
     }
     setIsTranslating(false)
   }, [chunks, translations])

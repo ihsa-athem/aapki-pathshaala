@@ -129,7 +129,10 @@ export async function translateTranscript(text, targetLanguage = 'en', style = '
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text, target_language: targetLanguage, style }),
   })
-  if (!res.ok) throw new Error('Translation failed')
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.detail || `Translation request failed (HTTP ${res.status})`)
+  }
   return res.json()
 }
 

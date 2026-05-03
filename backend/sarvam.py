@@ -7,12 +7,12 @@ from typing import List
 
 from sarvamai import SarvamAI
 
-SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
 MAX_TTS_CHARS = 500
 
 
 def _get_client() -> SarvamAI:
-    return SarvamAI(api_subscription_key=SARVAM_API_KEY, timeout=180.0)
+    key = os.getenv("SARVAM_API_KEY", "").strip()
+    return SarvamAI(api_subscription_key=key, timeout=180.0)
 
 
 # ── STT helpers ───────────────────────────────────────────────────────────────
