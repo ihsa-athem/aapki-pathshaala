@@ -53,30 +53,49 @@ def _build_context(chunks: List[dict]) -> str:
     return "\n\n".join(parts)
 
 
-async def translate_transcript(text: str, target_language: str = "en", style: str = "standard") -> str:
-    """Translate a timestamped transcript, preserving [mm:ss] markers."""
-    client = _get_client()
+def _lang_label(target_language: str, style: str) -> str:
     if target_language == "hi":
-        lang_label = "Hindi (Devanagari script)"
-    elif style == "simple":
-        lang_label = (
+        return "Hindi (Devanagari script)"
+    if style == "simple":
+        return (
             "very simple, easy-to-understand English for primary/middle school students. "
             "Use short sentences, everyday vocabulary, and avoid jargon"
         )
-    else:
-        lang_label = "clear standard English"
+    return "clear standard English"
+
+
+async def _translate_batch(text: str, target_language: str, style: str) -> str:
+    client = _get_client()
+    label = _lang_label(target_language, style)
     resp = await client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=4096,
+        max_tokens=8192,
         system=(
-            f"You are a translator. Translate the given transcript to {lang_label}. "
+            f"You are a translator. Translate the given transcript to {label}. "
             "Preserve every [mm:ss] timestamp marker exactly as it appears — "
             "do not translate, move, or remove them. Only translate the text between markers. "
             "Keep the same paragraph/newline structure."
         ),
-        messages=[{"role": "user", "content": f"Translate to {lang_label}:\n\n{text}"}],
+        messages=[{"role": "user", "content": f"Translate to {label}:\n\n{text}"}],
     )
     return resp.content[0].text.strip()
+
+
+async def translate_transcript(text: str, target_language: str = "en", style: str = "standard") -> str:
+    """Translate a timestamped transcript, preserving [mm:ss] markers.
+
+    Batches long transcripts (>20 paragraphs) to stay within max_tokens.
+    """
+    paragraphs = [p for p in text.split('\n\n') if p.strip()]
+    BATCH = 20  # ~4 000 words per call — well within 8 192 output tokens
+    if len(paragraphs) <= BATCH:
+        return await _translate_batch(text, target_language, style)
+
+    parts = []
+    for i in range(0, len(paragraphs), BATCH):
+        chunk = '\n\n'.join(paragraphs[i:i + BATCH])
+        parts.append(await _translate_batch(chunk, target_language, style))
+    return '\n\n'.join(parts)
 
 
 async def generate_fun_facts(chunks: List[dict]) -> List[str]:

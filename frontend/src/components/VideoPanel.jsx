@@ -142,6 +142,7 @@ export default function VideoPanel({ youtubeId, chunks, isLoading, language, onS
   const [transcriptLang, setTranscriptLang]   = useState('original')
   const [translations, setTranslations]       = useState({})  // cache per lang key
   const [isTranslating, setIsTranslating]     = useState(false)
+  const [translationError, setTranslationError] = useState('')
 
   const visibleChunks = transcriptLang === 'original'
     ? chunks
@@ -167,6 +168,7 @@ export default function VideoPanel({ youtubeId, chunks, isLoading, language, onS
 
   const handleTranscriptLangChange = useCallback(async (lang) => {
     setTranscriptLang(lang)
+    setTranslationError('')
     if (lang === 'original') return
     if (translations[lang]) return // already cached
 
@@ -185,6 +187,7 @@ export default function VideoPanel({ youtubeId, chunks, isLoading, language, onS
     } catch (e) {
       console.error('Translate failed:', e)
       setTranscriptLang('original')
+      setTranslationError('Translation failed — check that ANTHROPIC_API_KEY is set in Railway.')
     }
     setIsTranslating(false)
   }, [chunks, translations])
@@ -400,6 +403,15 @@ export default function VideoPanel({ youtubeId, chunks, isLoading, language, onS
             </button>
           )}
         </div>
+
+        {/* Translation error */}
+        {translationError && (
+          <div className="flex items-center gap-2 px-3 py-1.5 bg-red-50 border-b border-red-100 text-xs text-red-700 flex-shrink-0">
+            <span>⚠️</span>
+            <span className="flex-1">{translationError}</span>
+            <button onClick={() => setTranslationError('')} className="text-red-400 hover:text-red-600">✕</button>
+          </div>
+        )}
 
         {/* Translation progress bar — slim gradient bar below header */}
         {isTranslating && (

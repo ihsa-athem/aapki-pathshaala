@@ -797,7 +797,12 @@ async def transcribe_question_route(audio: UploadFile = File(...)):
         language = "hi" if "hi" in lang_code.lower() else "en"
         return {"question_text": transcript, "detected_language": language}
     except Exception as e:
-        raise HTTPException(500, f"STT failed: {e}")
+        err = str(e)
+        if "403" in err or "invalid_api_key" in err or "authentication" in err.lower():
+            raise HTTPException(503, "Voice input unavailable — Sarvam API key is invalid or expired. Please update SARVAM_API_KEY in Railway.")
+        if "429" in err or "rate" in err.lower():
+            raise HTTPException(429, "Voice input temporarily unavailable — Sarvam API rate limit reached. Please try again later.")
+        raise HTTPException(500, f"Voice transcription failed. Please try again.")
 
 
 @app.post("/api/speak-answer")
