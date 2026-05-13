@@ -96,7 +96,7 @@ docker compose up --build
 4. Add env var: `VITE_API_URL=https://<your-railway-url>`
 5. Deploy
 
-**Live demo**: _add your deployed URL here_
+**Live demo**: https://aapki-pathshaala.vercel.app
 
 ## API Keys Required
 
